@@ -1,0 +1,28 @@
+Roseto Gast-Werkzeuge
+=====================
+
+Diese CD hat Roseto in deinen PowerPC-Mac eingelegt.
+
+Einmalig installieren: Programme > Dienstprogramme > Terminal öffnen und
+eingeben:
+
+    sh "/Volumes/Roseto Tools/install.sh"
+
+Was installiert wird:
+
+  /Library/Roseto/RosetoAgent.app   Anmeldeobjekt, startet den Agenten
+  /Library/Roseto/roseto-agent.sh   übernimmt Programme von Roseto-CDs,
+                                    kopiert sie nach ~/Applications/Roseto
+                                    und startet sie
+  /Library/Roseto/roseto-hosts.sh   übernimmt die Hosts-Einträge (z. B. für
+                                    deinen MSN-Server) nach /etc/hosts
+  /Library/LaunchDaemons/de.roseto.hosts.plist
+
+Protokoll des Agenten:
+  ~/Library/Application Support/Roseto/agent.log
+
+Deinstallieren:
+  sudo launchctl unload /Library/LaunchDaemons/de.roseto.hosts.plist
+  sudo rm -rf /Library/Roseto /Library/LaunchDaemons/de.roseto.hosts.plist
+  und RosetoAgent in den Systemeinstellungen > Benutzer > Anmeldeobjekte
+  entfernen.

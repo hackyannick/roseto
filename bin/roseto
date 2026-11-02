@@ -1,0 +1,878 @@
+#!/bin/bash
+#
+# Roseto – eine Rosetta-artige Übersetzungsschicht, die PowerPC-Mac-Programme
+# auf Apple-Silicon-Macs (ARM64, z. B. M1–M4) ausführt.
+#
+# Funktionsweise in einem Satz:
+#   Die Befehlsübersetzung PowerPC -> ARM64 übernimmt QEMUs "Tiny Code
+#   Generator" (ein JIT-Binärübersetzer, also dasselbe Prinzip wie Rosetta),
+#   und weil macOS 11+ keine PowerPC-, 32-Bit-, Carbon- oder CFM-Bibliotheken
+#   mehr enthält, bringt Roseto das originale PowerPC-Mac-OS als
+#   "Bibliotheks-Schicht" mit. Roseto automatisiert alles drumherum:
+#   Architektur erkennen, Programm in den PowerPC-Mac übergeben, dort
+#   automatisch starten, Hosts-Einträge für eigene Server (z. B. MSN) setzen.
+#
+# Läuft mit dem macOS-eigenen /bin/bash 3.2 (keine Bash-4-Features verwenden!).
+
+set -o pipefail
+
+ROSETO_VERSION="0.1.0"
+PROFILES="tiger leopard panther os9"
+
+# Homebrew-Pfade ergänzen (wichtig, wenn Roseto aus der App heraus läuft)
+case ":$PATH:" in
+  *:/opt/homebrew/bin:*) ;;
+  *) PATH="/opt/homebrew/bin:/usr/local/bin:$PATH" ;;
+esac
+export PATH
+
+# --------------------------------------------------------------------------
+# Hilfsfunktionen
+# --------------------------------------------------------------------------
+
+say()  { printf '%s\n' "$*"; }
+info() { printf 'roseto: %s\n' "$*" >&2; }
+warn() { printf 'roseto: Warnung: %s\n' "$*" >&2; }
+die()  { printf 'roseto: Fehler: %s\n' "$*" >&2; exit 1; }
+
+have() { command -v "$1" >/dev/null 2>&1; }
+
+resolve_root() {
+  local src="$0" dir
+  while [ -h "$src" ]; do
+    dir="$(cd -P "$(dirname "$src")" && pwd)"
+    src="$(readlink "$src")"
+    case $src in /*) ;; *) src="$dir/$src" ;; esac
+  done
+  cd -P "$(dirname "$src")/.." && pwd
+}
+
+ROSETO_ROOT="$(resolve_root)"
+GUEST_SRC="$ROSETO_ROOT/guest"
+ROSETO_HOME="${ROSETO_HOME:-$HOME/.roseto}"
+HOST_OS="$(uname -s)"
+
+# Konfiguration laden: ~/.roseto/config enthält Zeilen der Form ROSETO_X=wert.
+# Bereits gesetzte Umgebungsvariablen haben Vorrang.
+load_config() {
+  local file="$ROSETO_HOME/config" line key val isset
+  [ -f "$file" ] || return 0
+  while IFS= read -r line || [ -n "$line" ]; do
+    case $line in ''|'#'*) continue ;; esac
+    key="${line%%=*}"
+    val="${line#*=}"
+    case $key in ROSETO_*) ;; *) continue ;; esac
+    case $key in *[!A-Z0-9_]*) continue ;; esac
+    val="${val#\"}"; val="${val%\"}"
+    eval "isset=\${$key+x}"
+    [ -n "$isset" ] || eval "$key=\$val"
+  done < "$file"
+}
+load_config
+
+: "${ROSETO_PROFILE:=tiger}"
+: "${ROSETO_QEMU:=qemu-system-ppc}"
+: "${ROSETO_QEMU_IMG:=qemu-img}"
+: "${ROSETO_RESOLUTION:=1024x768x32}"
+if [ -z "${ROSETO_DISPLAY:-}" ] && [ "$HOST_OS" = Darwin ]; then
+  ROSETO_DISPLAY=cocoa
+fi
+
+# Laufwerks-ID des CD-Laufwerks (QEMU vergibt sie für -drive if=ide,index=2)
+CD_DEV="ide1-cd0"
+
+DRY_RUN="${ROSETO_DRY_RUN:-}"
+PROFILE_EXPLICIT=""
+
+# --------------------------------------------------------------------------
+# Profile (welches PowerPC-System läuft im Hintergrund)
+# --------------------------------------------------------------------------
+
+profile_info() {
+  case $1 in
+    tiger)   P_DESC="Mac OS X 10.4 Tiger (PowerPC)";    P_KIND=osx; P_RAM=1024; P_SIZE=20G ;;
+    leopard) P_DESC="Mac OS X 10.5 Leopard (PowerPC)";  P_KIND=osx; P_RAM=1536; P_SIZE=25G ;;
+    panther) P_DESC="Mac OS X 10.3 Panther (PowerPC)";  P_KIND=osx; P_RAM=768;  P_SIZE=15G ;;
+    os9)     P_DESC="Mac OS 9.2 (Classic, PowerPC)";    P_KIND=os9; P_RAM=512;  P_SIZE=4G  ;;
+    *) die "Unbekanntes Profil '$1' (verfügbar: $PROFILES)" ;;
+  esac
+  [ -n "${ROSETO_RAM:-}" ] && P_RAM="$ROSETO_RAM"
+  [ -n "${ROSETO_DISK_SIZE:-}" ] && P_SIZE="$ROSETO_DISK_SIZE"
+  return 0
+}
+
+use_profile() {
+  PROFILE="$1"
+  profile_info "$1"
+  VM_DIR="$ROSETO_HOME/vms/$PROFILE"
+  DISK="$VM_DIR/disk.qcow2"
+  SOCK="$VM_DIR/monitor.sock"
+  PIDFILE="$VM_DIR/qemu.pid"
+  LOGFILE="$VM_DIR/qemu.log"
+}
+
+# --------------------------------------------------------------------------
+# Architektur-Erkennung (Mach-O, Fat/Universal, PEF/CFM, Classic)
+# --------------------------------------------------------------------------
+
+read_hex() { # datei offset anzahl -> hex ohne Leerzeichen
+  od -An -tx1 -j "$2" -N "$3" "$1" 2>/dev/null | tr -d ' \n'
+}
+
+swap32() { # little-endian hex -> big-endian hex
+  local h="$1"
+  printf '%s' "${h:6:2}${h:4:2}${h:2:2}${h:0:2}"
+}
+
+cpu_name() {
+  case $1 in
+    18)       printf 'ppc' ;;
+    16777234) printf 'ppc64' ;;
+    7)        printf 'i386' ;;
+    16777223) printf 'x86_64' ;;
+    12)       printf 'arm' ;;
+    16777228) printf 'arm64' ;;
+    *)        printf 'cpu-%s' "$1" ;;
+  esac
+}
+
+# Gibt die Architekturen einer einzelnen Datei aus (durch Leerzeichen getrennt)
+detect_archs() {
+  local f="$1" magic h n i out=""
+  [ -f "$f" ] || return 0
+  magic="$(read_hex "$f" 0 4)"
+  case $magic in
+    feedface|feedfacf)
+      h="$(read_hex "$f" 4 4)"; [ ${#h} -eq 8 ] && out="$(cpu_name $((16#$h)))" ;;
+    cefaedfe|cffaedfe)
+      h="$(swap32 "$(read_hex "$f" 4 4)")"; [ ${#h} -eq 8 ] && out="$(cpu_name $((16#$h)))" ;;
+    cafebabe)
+      h="$(read_hex "$f" 4 4)"
+      if [ ${#h} -eq 8 ]; then
+        n=$((16#$h))
+        # Java-Klassendateien beginnen ebenfalls mit cafebabe (dann ist n riesig)
+        if [ "$n" -gt 0 ] && [ "$n" -lt 32 ]; then
+          i=0
+          while [ $i -lt "$n" ]; do
+            h="$(read_hex "$f" $((8 + i * 20)) 4)"
+            [ ${#h} -eq 8 ] && out="$out $(cpu_name $((16#$h)))"
+            i=$((i + 1))
+          done
+        fi
+      fi ;;
+    4a6f7921) # "Joy!" = PEF (Code Fragment Manager)
+      h="$(read_hex "$f" 4 8)"
+      case $h in
+        7065666670777063) # "peffpwpc"
+          if LC_ALL=C grep -q 'CarbonLib' "$f" 2>/dev/null; then
+            out="pef-carbon"
+          else
+            out="pef-classic"
+          fi ;;
+        706566666d36386b) out="pef-68k" ;;  # "peffm68k"
+        *) out="pef" ;;
+      esac ;;
+  esac
+  if [ -z "$out" ] && [ "$HOST_OS" = Darwin ] && [ -s "$f/..namedfork/rsrc" ]; then
+    # Nur Resource-Fork, kein bekannter Datenfork-Header -> klassisches Mac-Programm
+    out="classic"
+  fi
+  printf '%s' "${out# }"
+}
+
+plist_get() { # plist schlüssel
+  local plist="$1" key="$2" v=""
+  if [ -x /usr/libexec/PlistBuddy ]; then
+    v="$(/usr/libexec/PlistBuddy -c "Print :$key" "$plist" 2>/dev/null)"
+  fi
+  if [ -z "$v" ]; then
+    v="$(tr -d '\r' < "$plist" 2>/dev/null | tr '\n' ' ' |
+      sed -n "s/.*<key>$key<\/key>[[:space:]]*<string>\([^<]*\)<\/string>.*/\1/p")"
+  fi
+  printf '%s' "$v"
+}
+
+# classify <pfad>  -> setzt C_TYPE, C_EXEC, C_ARCHS, C_CLASS
+#   C_CLASS: native | rosetta2 | ppc | classic | i386 | archive | unknown
+classify() {
+  local p="$1" exe="" name lower
+  C_TYPE=""; C_EXEC=""; C_ARCHS=""; C_CLASS="unknown"
+  name="$(basename "$p")"
+  lower="$(printf '%s' "$name" | tr '[:upper:]' '[:lower:]')"
+
+  if [ -d "$p" ]; then
+    if [ -d "$p/Contents" ]; then
+      C_TYPE="bundle"
+      if [ -f "$p/Contents/Info.plist" ]; then
+        exe="$(plist_get "$p/Contents/Info.plist" CFBundleExecutable)"
+      fi
+      if [ -n "$exe" ] && [ -f "$p/Contents/MacOS/$exe" ]; then
+        C_EXEC="Contents/MacOS/$exe"
+      elif [ -n "$exe" ] && [ -f "$p/Contents/MacOSClassic/$exe" ]; then
+        C_EXEC="Contents/MacOSClassic/$exe"
+      else
+        # Fallback: erste Datei in Contents/MacOS
+        for exe in "$p"/Contents/MacOS/* "$p"/Contents/MacOSClassic/*; do
+          [ -f "$exe" ] && { C_EXEC="${exe#"$p"/}"; break; }
+        done
+      fi
+      [ -n "$C_EXEC" ] && C_ARCHS="$(detect_archs "$p/$C_EXEC")"
+      case $C_EXEC in Contents/MacOSClassic/*) [ -z "$C_ARCHS" ] && C_ARCHS="classic" ;; esac
+    else
+      C_TYPE="folder"
+    fi
+  elif [ -f "$p" ]; then
+    C_TYPE="file"
+    case $lower in
+      *.dmg|*.img|*.smi|*.sit|*.sitx|*.sea|*.hqx|*.bin|*.pkg|*.mpkg|*.zip|*.tar|*.tgz|*.gz|*.cdr|*.toast)
+        C_TYPE="archive"; C_CLASS="archive"
+        # .bin kann auch ein echtes Programm sein -> trotzdem Header prüfen
+        C_ARCHS="$(detect_archs "$p")"
+        [ -z "$C_ARCHS" ] && return 0 ;;
+      *) C_ARCHS="$(detect_archs "$p")" ;;
+    esac
+  else
+    C_TYPE="missing"; return 0
+  fi
+
+  case " $C_ARCHS " in
+    *" arm64 "*)                       C_CLASS="native" ;;
+    *" x86_64 "*)                      C_CLASS="rosetta2" ;;
+    *" ppc "*|*" ppc64 "*|*" pef-carbon "*) C_CLASS="ppc" ;;
+    *" pef-classic "*|*" pef-68k "*|*" classic "*) C_CLASS="classic" ;;
+    *" i386 "*)                        C_CLASS="i386" ;;
+    *) [ "$C_TYPE" = archive ] && C_CLASS="archive" || C_CLASS="unknown" ;;
+  esac
+}
+
+class_text() {
+  case $1 in
+    native)   printf 'Apple Silicon (ARM64) – läuft nativ, Roseto wird nicht gebraucht' ;;
+    rosetta2) printf 'Intel 64-Bit – läuft über Apples Rosetta 2, Roseto wird nicht gebraucht' ;;
+    ppc)      printf 'PowerPC Mac OS X – wird von Roseto übersetzt' ;;
+    classic)  printf 'Klassisches Mac OS (OS 9) – braucht das Roseto-Profil "os9"' ;;
+    i386)     printf 'Nur Intel 32-Bit – läuft auf keinem aktuellen macOS und nicht in Roseto' ;;
+    archive)  printf 'Archiv/Installer – wird im PowerPC-Mac geöffnet' ;;
+    *)        printf 'Unbekannt – wird im PowerPC-Mac geöffnet' ;;
+  esac
+}
+
+# --------------------------------------------------------------------------
+# QEMU-Steuerung
+# --------------------------------------------------------------------------
+
+vm_running() {
+  local pid
+  [ -f "$PIDFILE" ] || return 1
+  pid="$(cat "$PIDFILE" 2>/dev/null)"
+  [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null
+}
+
+monitor_cmd() { # sendet einen Befehl an den QEMU-Monitor und gibt die Antwort aus
+  [ -S "$SOCK" ] || return 1
+  if have socat; then
+    { printf '%s\n' "$1"; sleep 1; } | socat - "UNIX-CONNECT:$SOCK" 2>/dev/null
+  elif have nc; then
+    # -w 2: nc beendet sich, sobald der Monitor 2 s lang nichts mehr sendet
+    { printf '%s\n' "$1"; sleep 1; } | nc -U -w 2 "$SOCK" 2>/dev/null
+  else
+    die "Weder 'nc' noch 'socat' gefunden – kann QEMU nicht steuern."
+  fi
+}
+
+qemu_escape() { # Kommas in Pfaden für QEMU-Optionen verdoppeln
+  printf '%s' "${1//,/,,}"
+}
+
+build_qemu_cmd() { # boot-laufwerk(c|d) [cd-image]
+  local boot="$1" cd="${2:-}" cdopt
+  cdopt="if=ide,index=2,media=cdrom"
+  [ -n "$cd" ] && cdopt="$cdopt,file=$(qemu_escape "$cd"),format=raw"
+
+  # shellcheck disable=SC2054  # Kommas gehören zu QEMU-Optionen
+  QEMU_CMD=("$ROSETO_QEMU"
+    -name "Roseto - $P_DESC"
+    -M mac99,via=pmu
+    -m "$P_RAM"
+    -g "$ROSETO_RESOLUTION"
+    -drive "file=$(qemu_escape "$DISK"),format=qcow2,if=ide,index=0"
+    -drive "$cdopt"
+    -netdev "user,id=net0"
+    -device "sungem,netdev=net0"
+    -boot "$boot"
+    -monitor "unix:$(qemu_escape "$SOCK"),server,nowait")
+
+  if [ "$P_KIND" = os9 ]; then
+    QEMU_CMD+=(-prom-env "vga-ndrv?=true" -prom-env "auto-boot?=true")
+  fi
+  [ -n "${ROSETO_VERBOSE_BOOT:-}" ] && QEMU_CMD+=(-prom-env "boot-args=-v")
+  [ -n "${ROSETO_TABLET:-}" ] && QEMU_CMD+=(-device usb-tablet)
+  [ -n "${ROSETO_DISPLAY:-}" ] && QEMU_CMD+=(-display "$ROSETO_DISPLAY")
+  if [ -n "${ROSETO_QEMU_EXTRA:-}" ]; then
+    # bewusst ungequotet: zusätzliche Optionen werden an Leerzeichen getrennt
+    # shellcheck disable=SC2206
+    QEMU_CMD+=($ROSETO_QEMU_EXTRA)
+  fi
+  return 0
+}
+
+need_qemu() {
+  [ -n "$DRY_RUN" ] && return 0
+  have "$ROSETO_QEMU" || die "QEMU nicht gefunden ('$ROSETO_QEMU'). Installieren mit:  brew install qemu"
+}
+
+print_cmd() { # Befehl lesbar ausgeben (nur Argumente mit Sonderzeichen quoten)
+  local a out=""
+  for a in "$@"; do
+    case $a in
+      *[!A-Za-z0-9_./:=,@+%?-]*|'')
+        out="$out '$(printf '%s' "$a" | sed "s/'/'\\\\''/g")'" ;;
+      *) out="$out $a" ;;
+    esac
+  done
+  printf '%s\n' "${out# }"
+}
+
+vm_launch() { # boot-laufwerk [cd-image]
+  local pid i
+  need_qemu
+  mkdir -p "$VM_DIR"
+  build_qemu_cmd "$@"
+  if [ -n "$DRY_RUN" ]; then
+    print_cmd "${QEMU_CMD[@]}"
+    return 0
+  fi
+  vm_running && die "Der PowerPC-Mac ($PROFILE) läuft bereits."
+  rm -f "$SOCK"
+  nohup "${QEMU_CMD[@]}" >"$LOGFILE" 2>&1 </dev/null &
+  pid=$!
+  printf '%s\n' "$pid" > "$PIDFILE"
+  i=0
+  while [ $i -lt 50 ]; do
+    [ -S "$SOCK" ] && break
+    kill -0 "$pid" 2>/dev/null || break
+    sleep 0.2
+    i=$((i + 1))
+  done
+  if ! kill -0 "$pid" 2>/dev/null; then
+    rm -f "$PIDFILE"
+    tail -n 20 "$LOGFILE" >&2
+    die "QEMU wurde unerwartet beendet (Protokoll: $LOGFILE)"
+  fi
+  info "PowerPC-Mac gestartet: $P_DESC (PID $pid)"
+}
+
+# --------------------------------------------------------------------------
+# Transfer-Disks (HFS-CD-Images, die "in den PowerPC-Mac eingelegt" werden)
+# --------------------------------------------------------------------------
+
+copy_preserving() { # quelle ziel – erhält Resource-Forks und Finder-Infos
+  if [ "$HOST_OS" = Darwin ] && have ditto; then
+    ditto "$1" "$2"
+  else
+    cp -Rp "$1" "$2"
+  fi
+}
+
+make_disc() { # quellordner volumename ziel.iso
+  local src="$1" vol="$2" out="$3"
+  rm -f "$out"
+  if [ "$HOST_OS" = Darwin ] && have hdiutil; then
+    hdiutil makehybrid -quiet -hfs -hfs-volume-name "$vol" -o "$out" "$src" >/dev/null ||
+      die "hdiutil konnte das Disk-Image nicht erstellen."
+  elif have genisoimage; then
+    genisoimage -quiet -hfs -r -J -V "$vol" -o "$out" "$src" || die "genisoimage fehlgeschlagen."
+  elif have mkisofs; then
+    mkisofs -quiet -hfs -r -J -V "$vol" -o "$out" "$src" || die "mkisofs fehlgeschlagen."
+  elif have xorriso; then
+    xorriso -as mkisofs -quiet -hfsplus -r -J -V "$vol" -o "$out" "$src" >/dev/null 2>&1 ||
+      die "xorriso fehlgeschlagen."
+  else
+    die "Kein Werkzeug zum Erstellen von Disk-Images gefunden (hdiutil, genisoimage, mkisofs, xorriso)."
+  fi
+  [ -f "$out" ] || die "Disk-Image wurde nicht erstellt: $out"
+}
+
+new_job_id() {
+  printf '%s-%s' "$(date +%Y%m%d-%H%M%S)" "$$"
+}
+
+hosts_file() { printf '%s' "$ROSETO_HOME/hosts"; }
+
+ensure_hosts_file() {
+  local f
+  f="$(hosts_file)"
+  [ -f "$f" ] && return 0
+  mkdir -p "$ROSETO_HOME"
+  cat > "$f" <<'EOF'
+# Roseto – Hosts-Einträge, die im PowerPC-Mac (Gast) in /etc/hosts landen.
+#
+# Format:   IP-Adresse   Hostname [Hostname ...]
+#
+# 10.0.2.2 ist aus Sicht des PowerPC-Macs immer dein echter Mac (der Host).
+# Läuft dein MSN-Server also auf diesem Mac, trägst du 10.0.2.2 ein. Läuft er
+# auf einem anderen Rechner im Netz, nimm dessen normale LAN-IP.
+#
+# Beispiele – "#" am Zeilenanfang entfernen, um sie zu aktivieren, und an die
+# Hostnamen anpassen, die dein Server bedient:
+# 10.0.2.2   messenger.hotmail.com gateway.messenger.hotmail.com
+# 10.0.2.2   login.passport.com loginnet.passport.com nexus.passport.com
+# 10.0.2.2   explorer.msn.com
+EOF
+}
+
+hosts_active() { # nur aktive Zeilen
+  ensure_hosts_file
+  sed -e 's/#.*//' -e 's/[[:space:]]*$//' "$(hosts_file)" | grep -E '^[[:space:]]*[0-9A-Fa-f:.]+[[:space:]]+[^[:space:]]' || true
+}
+
+stage_common() { # stage-ordner – legt Hosts-Datei bei
+  hosts_active > "$1/roseto-hosts.txt"
+}
+
+deliver_disc() { # iso – legt Disk ein oder startet die VM mit dieser Disk
+  local iso="$1" f
+  if [ -n "$DRY_RUN" ]; then
+    if vm_running; then
+      say "monitor: eject -f $CD_DEV"
+      say "monitor: change $CD_DEV \"$iso\" raw"
+    else
+      vm_launch c "$iso"
+    fi
+    return 0
+  fi
+  if vm_running; then
+    monitor_cmd "eject -f $CD_DEV" >/dev/null
+    monitor_cmd "change $CD_DEV \"$iso\" raw" >/dev/null
+    if monitor_cmd "info block $CD_DEV" | grep -F "$(basename "$iso")" >/dev/null; then
+      info "Disk in den laufenden PowerPC-Mac eingelegt."
+    else
+      die "Konnte die Disk nicht einlegen (Monitor: $SOCK)."
+    fi
+  else
+    [ -f "$DISK" ] || die "Für das Profil '$PROFILE' ist noch kein PowerPC-Mac eingerichtet. Zuerst:  roseto setup <Installations-Image>"
+    vm_launch c "$iso"
+  fi
+  # alte Transfer-Disks aufräumen
+  for f in "$VM_DIR"/disc-*.iso; do
+    [ -f "$f" ] && [ "$f" != "$iso" ] && rm -f "$f"
+  done
+  return 0
+}
+
+# --------------------------------------------------------------------------
+# Befehle
+# --------------------------------------------------------------------------
+
+usage() {
+  cat <<EOF
+Roseto $ROSETO_VERSION – PowerPC-Mac-Programme auf Apple Silicon ausführen
+
+Verwendung: roseto [--profile NAME] [--dry-run] BEFEHL [ARGUMENTE]
+
+Programme:
+  run PROGRAMM...        PowerPC-Programm (App, Installer, .dmg, .sit, ...) im
+                         PowerPC-Mac starten. Native Apps werden direkt geöffnet.
+      --copy             nur in den PowerPC-Mac kopieren, nicht starten
+      --force            auch native/Intel-Apps im PowerPC-Mac öffnen
+  info PROGRAMM...       Architektur erkennen (PowerPC, Intel, ARM, Classic, ...)
+
+PowerPC-Mac verwalten:
+  setup IMAGE            PowerPC-Mac einrichten und vom Installations-Image
+                         (.iso/.cdr/.toast/.dmg) booten
+      --size GRÖSSE      Größe der virtuellen Festplatte (Standard je Profil)
+      --reinstall        vorhandene Festplatte behalten, nur Installer booten
+  start                  PowerPC-Mac starten
+  stop [--force]         herunterfahren (--force: sofort beenden)
+  status                 Zustand aller Profile anzeigen
+  tools                  Gast-Werkzeuge-CD einlegen (einmalig im Gast installieren)
+  eject                  CD aus dem PowerPC-Mac auswerfen
+  log                    QEMU-Protokoll anzeigen
+
+Netzwerk (z. B. für deinen eigenen MSN-Server):
+  hosts                  aktive Hosts-Einträge anzeigen
+  hosts add IP NAME...   Eintrag hinzufügen (10.0.2.2 = dieser Mac)
+  hosts remove NAME      Einträge mit diesem Hostnamen entfernen
+  hosts edit             Hosts-Datei im Editor öffnen
+  hosts push             Hosts sofort an den laufenden PowerPC-Mac senden
+
+Sonstiges:
+  doctor                 Voraussetzungen prüfen
+  version                Version anzeigen
+
+Profile: tiger (Standard), leopard, panther, os9   – aktuell: $ROSETO_PROFILE
+Daten:   $ROSETO_HOME
+EOF
+}
+
+cmd_info() {
+  local short="" p
+  if [ "${1:-}" = "--short" ]; then short=1; shift; fi
+  [ $# -ge 1 ] || die "Verwendung: roseto info PROGRAMM..."
+  for p in "$@"; do
+    p="${p%/}"
+    classify "$p"
+    if [ -n "$short" ]; then
+      say "$C_CLASS ${C_ARCHS:--}"
+      continue
+    fi
+    [ "$C_TYPE" = missing ] && { warn "Nicht gefunden: $p"; continue; }
+    say "Datei:        $p"
+    case $C_TYPE in
+      bundle)  say "Typ:          App-Bundle${C_EXEC:+ (Programm: $C_EXEC)}" ;;
+      folder)  say "Typ:          Ordner" ;;
+      archive) say "Typ:          Archiv / Disk-Image / Installer" ;;
+      *)       say "Typ:          Datei" ;;
+    esac
+    say "Architektur:  ${C_ARCHS:-unbekannt}"
+    say "Ergebnis:     $(class_text "$C_CLASS")"
+    [ $# -gt 1 ] && say ""
+  done
+}
+
+cmd_setup() {
+  local image="" size="" reinstall="" lower
+  while [ $# -gt 0 ]; do
+    case $1 in
+      --size) size="${2:-}"; shift 2 || die "--size braucht einen Wert" ;;
+      --size=*) size="${1#--size=}"; shift ;;
+      --reinstall) reinstall=1; shift ;;
+      -*) die "Unbekannte Option: $1" ;;
+      *) image="$1"; shift ;;
+    esac
+  done
+  [ -n "$image" ] || die "Verwendung: roseto setup [--profile tiger|leopard|panther|os9] INSTALLATIONS-IMAGE"
+  [ -f "$image" ] || die "Image nicht gefunden: $image"
+  [ -n "$size" ] || size="$P_SIZE"
+  need_qemu
+  vm_running && die "Der PowerPC-Mac ($PROFILE) läuft gerade – bitte zuerst beenden."
+  mkdir -p "$VM_DIR"
+
+  lower="$(printf '%s' "$image" | tr '[:upper:]' '[:lower:]')"
+  case $lower in
+    *.dmg)
+      [ "$HOST_OS" = Darwin ] || die ".dmg-Images können nur unter macOS umgewandelt werden."
+      info "Wandle $image in ein CD/DVD-Master-Image um ..."
+      rm -f "$VM_DIR/installer.cdr"
+      if [ -z "$DRY_RUN" ]; then
+        hdiutil convert "$image" -format UDTO -o "$VM_DIR/installer" >/dev/null ||
+          die "Umwandlung fehlgeschlagen."
+      fi
+      image="$VM_DIR/installer.cdr" ;;
+  esac
+
+  if [ -f "$DISK" ]; then
+    [ -n "$reinstall" ] || die "Es gibt bereits eine Festplatte für '$PROFILE' ($DISK). Zum erneuten Booten des Installers --reinstall verwenden, oder die Datei vorher selbst löschen."
+  else
+    info "Erstelle virtuelle Festplatte ($size) ..."
+    if [ -n "$DRY_RUN" ]; then
+      say "$ROSETO_QEMU_IMG create -f qcow2 $DISK $size"
+    else
+      "$ROSETO_QEMU_IMG" create -q -f qcow2 "$DISK" "$size" || die "qemu-img fehlgeschlagen."
+    fi
+  fi
+
+  vm_launch d "$image"
+  [ -n "$DRY_RUN" ] && return 0
+  if [ "$P_KIND" = os9 ]; then
+    cat <<EOF
+
+So geht's weiter (im Fenster des PowerPC-Macs):
+  1. Laufwerke konfigurieren (Drive Setup) -> virtuelle Festplatte initialisieren
+  2. Mac OS 9 installieren
+  3. Fenster schließen, dann:  roseto --profile os9 start
+EOF
+  else
+    cat <<EOF
+
+So geht's weiter (im Fenster des PowerPC-Macs):
+  1. Sprache wählen, dann Menü "Dienstprogramme" -> "Festplatten-Dienstprogramm"
+  2. Die QEMU-Festplatte löschen: Format "Mac OS Extended (Journaled)"
+  3. Festplatten-Dienstprogramm beenden und Mac OS X installieren
+  4. Wenn der Mac nach der Installation neu startet und wieder den Installer
+     zeigt: Fenster schließen und dann
+         roseto start
+     Nach der Ersteinrichtung des Benutzers:
+         roseto tools
+EOF
+  fi
+}
+
+cmd_start() {
+  [ -f "$DISK" ] || die "Für '$PROFILE' ist noch kein PowerPC-Mac eingerichtet. Zuerst:  roseto setup <Installations-Image>"
+  if vm_running && [ -z "$DRY_RUN" ]; then
+    info "Der PowerPC-Mac ($PROFILE) läuft bereits."
+    return 0
+  fi
+  vm_launch c
+}
+
+cmd_stop() {
+  local force="" i
+  [ "${1:-}" = "--force" ] && force=1
+  vm_running || { info "Der PowerPC-Mac ($PROFILE) läuft nicht."; return 0; }
+  if [ -n "$force" ]; then
+    monitor_cmd "quit" >/dev/null || kill "$(cat "$PIDFILE")" 2>/dev/null
+    i=0
+    while vm_running && [ $i -lt 25 ]; do sleep 0.2; i=$((i + 1)); done
+    vm_running && kill -9 "$(cat "$PIDFILE")" 2>/dev/null
+    rm -f "$PIDFILE" "$SOCK"
+    info "PowerPC-Mac beendet."
+  else
+    monitor_cmd "system_powerdown" >/dev/null
+    info "Ausschalt-Signal gesendet. Falls der PowerPC-Mac nicht reagiert: im Gast"
+    info "Apple-Menü -> Ausschalten wählen, oder  roseto stop --force"
+  fi
+}
+
+cmd_status() {
+  local p
+  for p in $PROFILES; do
+    use_profile "$p"
+    if [ -f "$DISK" ]; then
+      if vm_running; then
+        say "$p: läuft (PID $(cat "$PIDFILE"))  – $P_DESC"
+      else
+        say "$p: eingerichtet, gestoppt     – $P_DESC"
+      fi
+    else
+      say "$p: nicht eingerichtet         – $P_DESC"
+    fi
+  done
+  say ""
+  say "Standard-Profil: $ROSETO_PROFILE"
+}
+
+cmd_tools() {
+  local job stage iso
+  [ "$P_KIND" = osx ] || die "Die Gast-Werkzeuge gibt es nur für Mac OS X-Profile (tiger, leopard, panther)."
+  job="$(new_job_id)"
+  stage="$ROSETO_HOME/tmp/tools-$job"
+  rm -rf "$stage"; mkdir -p "$stage"
+  cp "$GUEST_SRC"/install.sh "$GUEST_SRC"/install-root.sh "$GUEST_SRC"/roseto-agent.sh \
+     "$GUEST_SRC"/roseto-hosts.sh "$GUEST_SRC"/de.roseto.hosts.plist "$GUEST_SRC"/LIESMICH.txt "$stage/" ||
+    die "Gast-Werkzeuge nicht gefunden in $GUEST_SRC"
+  stage_common "$stage"
+  mkdir -p "$VM_DIR"
+  iso="$VM_DIR/disc-$job.iso"
+  make_disc "$stage" "Roseto Tools" "$iso"
+  rm -rf "$stage"
+  deliver_disc "$iso"
+  : > "$VM_DIR/tools-offered"
+  cat <<EOF
+
+Im PowerPC-Mac erscheint die CD "Roseto Tools". Dort einmalig:
+  Programme -> Dienstprogramme -> Terminal öffnen und eingeben:
+
+      sh "/Volumes/Roseto Tools/install.sh"
+
+Danach startet Roseto Programme automatisch, sobald du  roseto run ...
+benutzt oder ein Programm auf Roseto.app ziehst.
+EOF
+}
+
+cmd_eject() {
+  vm_running || die "Der PowerPC-Mac ($PROFILE) läuft nicht."
+  monitor_cmd "eject -f $CD_DEV" >/dev/null
+  info "CD ausgeworfen."
+}
+
+cmd_log() {
+  [ -f "$LOGFILE" ] || die "Noch kein Protokoll vorhanden ($LOGFILE)."
+  tail -n 50 "$LOGFILE"
+}
+
+cmd_run() {
+  local action=open force="" p cls="" has_classic="" native_only=1 job stage iso name
+  local targets=()
+  while [ $# -gt 0 ]; do
+    case $1 in
+      --copy) action=copy; shift ;;
+      --force) force=1; shift ;;
+      --) shift; while [ $# -gt 0 ]; do targets+=("${1%/}"); shift; done ;;
+      -*) die "Unbekannte Option: $1" ;;
+      *) targets+=("${1%/}"); shift ;;
+    esac
+  done
+  [ ${#targets[@]} -ge 1 ] || die "Verwendung: roseto run [--copy] [--force] PROGRAMM..."
+
+  for p in "${targets[@]}"; do
+    [ -e "$p" ] || die "Nicht gefunden: $p"
+    classify "$p"
+    case $C_CLASS in
+      native|rosetta2) ;;
+      i386) native_only=""
+            warn "$(basename "$p"): enthält nur Intel-32-Bit-Code – das kann Roseto nicht ausführen." ;;
+      classic) native_only=""; has_classic=1 ;;
+      *) native_only="" ;;
+    esac
+    cls="$cls $C_CLASS"
+  done
+
+  # Native bzw. Intel-64-Bit-Apps einfach mit macOS öffnen (wie Rosetta: nur wo nötig übersetzen)
+  if [ -n "$native_only" ] && [ -z "$force" ]; then
+    for p in "${targets[@]}"; do
+      info "$(basename "$p") läuft ohne Roseto – öffne direkt mit macOS."
+      if [ -n "$DRY_RUN" ]; then say "open $p"; elif [ "$HOST_OS" = Darwin ]; then open "$p"; fi
+    done
+    return 0
+  fi
+
+  # Profil wählen: Classic-Programme bevorzugt im os9-Profil
+  if [ -z "$PROFILE_EXPLICIT" ] && [ -n "$has_classic" ]; then
+    if [ -f "$ROSETO_HOME/vms/os9/disk.qcow2" ]; then
+      use_profile os9
+    else
+      warn "Klassisches Mac-OS-Programm erkannt, aber kein os9-Profil eingerichtet."
+      warn "Versuche es in $P_DESC (benötigt dort die Classic-Umgebung)."
+    fi
+  fi
+  if [ "$P_KIND" = osx ] && [ ! -f "$VM_DIR/tools-offered" ] && [ -f "$DISK" ]; then
+    warn "Gast-Werkzeuge evtl. noch nicht installiert – ohne sie startet nichts automatisch. ->  roseto tools"
+  fi
+
+  job="$(new_job_id)"
+  stage="$ROSETO_HOME/tmp/run-$job"
+  rm -rf "$stage"; mkdir -p "$stage/payload"
+  {
+    say "# Roseto-Auftrag"
+    say "JOB=$job"
+    say "ACTION=$action"
+    for p in "${targets[@]}"; do
+      name="$(basename "$p")"
+      say "TARGET=$name"
+    done
+  } > "$stage/roseto-autorun.txt"
+  for p in "${targets[@]}"; do
+    info "Übergebe $(basename "$p") an den PowerPC-Mac ..."
+    copy_preserving "$p" "$stage/payload/$(basename "$p")" || die "Kopieren fehlgeschlagen: $p"
+  done
+  stage_common "$stage"
+  mkdir -p "$VM_DIR"
+  iso="$VM_DIR/disc-$job.iso"
+  make_disc "$stage" "Roseto" "$iso"
+  rm -rf "$stage"
+  deliver_disc "$iso"
+
+  if [ "$P_KIND" = os9 ]; then
+    info "Im Mac-OS-9-Fenster erscheint die CD \"Roseto\" – Programm dort per Doppelklick starten."
+  else
+    info "Das Programm startet im Fenster \"Roseto - $P_DESC\" (beim ersten Start nach dem Booten)."
+  fi
+}
+
+cmd_hosts() {
+  local sub="${1:-list}" f tmp name ip job stage iso
+  ensure_hosts_file
+  f="$(hosts_file)"
+  case $sub in
+    list|"")
+      if [ -n "$(hosts_active)" ]; then hosts_active; else info "Keine aktiven Einträge. Datei: $f"; fi ;;
+    add)
+      shift
+      [ $# -ge 2 ] || die "Verwendung: roseto hosts add IP HOSTNAME..."
+      ip="$1"; shift
+      case $ip in *[!0-9A-Fa-f:.]*) die "Ungültige IP-Adresse: $ip" ;; esac
+      printf '%s   %s\n' "$ip" "$*" >> "$f"
+      info "Eingetragen: $ip $* (wirksam beim nächsten 'roseto run' oder 'roseto hosts push')" ;;
+    remove|rm)
+      shift
+      [ $# -ge 1 ] || die "Verwendung: roseto hosts remove HOSTNAME"
+      tmp="$f.tmp"
+      for name in "$@"; do
+        awk -v n="$name" '
+          /^[[:space:]]*#/ || NF < 2 { print; next }
+          { out = $1; for (i = 2; i <= NF; i++) if ($i != n) out = out "   " $i
+            if (out != $1) print out }' "$f" > "$tmp" && mv "$tmp" "$f"
+      done
+      info "Entfernt: $*" ;;
+    edit)
+      "${EDITOR:-nano}" "$f" ;;
+    push)
+      vm_running || die "Der PowerPC-Mac ($PROFILE) läuft nicht – die Hosts werden beim nächsten Start übernommen."
+      job="$(new_job_id)"
+      stage="$ROSETO_HOME/tmp/hosts-$job"
+      rm -rf "$stage"; mkdir -p "$stage"
+      stage_common "$stage"
+      iso="$VM_DIR/disc-$job.iso"
+      make_disc "$stage" "Roseto Hosts" "$iso"
+      rm -rf "$stage"
+      deliver_disc "$iso" ;;
+    *) die "Unbekannter Unterbefehl: hosts $sub" ;;
+  esac
+}
+
+cmd_doctor() {
+  local ok=1 arch v p
+  arch="$(uname -m)"
+  say "Roseto $ROSETO_VERSION"
+  say "System:      $HOST_OS $arch"
+  if [ "$HOST_OS" = Darwin ]; then
+    say "macOS:       $(sw_vers -productVersion 2>/dev/null)"
+  else
+    say "Hinweis:     Roseto ist für macOS gedacht; unter $HOST_OS fehlen hdiutil/ditto."
+  fi
+  if have "$ROSETO_QEMU"; then
+    v="$("$ROSETO_QEMU" --version 2>/dev/null | head -n 1)"
+    say "QEMU:        $v"
+  else
+    say "QEMU:        FEHLT  ->  brew install qemu"; ok=""
+  fi
+  if have "$ROSETO_QEMU_IMG"; then say "qemu-img:    ok"; else say "qemu-img:    FEHLT  ->  brew install qemu"; ok=""; fi
+  if have nc || have socat; then say "Monitor:     ok ($(have socat && echo socat || echo nc))"; else say "Monitor:     FEHLT (nc oder socat)"; ok=""; fi
+  if have hdiutil; then say "Disk-Images: hdiutil"
+  elif have genisoimage || have mkisofs || have xorriso; then say "Disk-Images: genisoimage/mkisofs/xorriso"
+  else say "Disk-Images: FEHLT"; ok=""; fi
+  say "Daten:       $ROSETO_HOME"
+  say ""
+  cmd_status
+  for p in $PROFILES; do
+    if [ -f "$ROSETO_HOME/vms/$p/disk.qcow2" ]; then ok_profile=1; fi
+  done
+  if [ -z "${ok_profile:-}" ]; then
+    say ""
+    say "Nächster Schritt:  roseto setup /pfad/zu/MacOSX-Tiger-PPC.iso"
+  fi
+  [ -n "$ok" ]
+}
+
+# --------------------------------------------------------------------------
+# Argumente
+# --------------------------------------------------------------------------
+
+main() {
+  local args=() profile="$ROSETO_PROFILE" cmd
+  while [ $# -gt 0 ]; do
+    case $1 in
+      -p|--profile) [ $# -ge 2 ] || die "--profile braucht einen Namen"
+                    profile="$2"; PROFILE_EXPLICIT=1; shift 2 ;;
+      --profile=*)  profile="${1#--profile=}"; PROFILE_EXPLICIT=1; shift ;;
+      -n|--dry-run) DRY_RUN=1; shift ;;
+      *) args+=("$1"); shift ;;
+    esac
+  done
+  use_profile "$profile"
+  set -- ${args[@]+"${args[@]}"}
+  cmd="${1:-help}"
+  [ $# -gt 0 ] && shift
+  case $cmd in
+    run)            cmd_run "$@" ;;
+    info)           cmd_info "$@" ;;
+    setup|install)  cmd_setup "$@" ;;
+    start|boot)     cmd_start "$@" ;;
+    stop)           cmd_stop "$@" ;;
+    status)         cmd_status ;;
+    tools)          cmd_tools ;;
+    eject)          cmd_eject ;;
+    log)            cmd_log ;;
+    hosts)          cmd_hosts "$@" ;;
+    doctor)         cmd_doctor ;;
+    version|--version|-v) say "Roseto $ROSETO_VERSION" ;;
+    help|--help|-h) usage ;;
+    *)
+      # "roseto Programm.app" als Abkürzung für "roseto run Programm.app"
+      if [ -e "$cmd" ]; then cmd_run "$cmd" "$@"; else usage >&2; die "Unbekannter Befehl: $cmd"; fi ;;
+  esac
+}
+
+main "$@"
