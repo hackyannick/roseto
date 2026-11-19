@@ -152,6 +152,31 @@ C="$(ROSETO_HOME="$AH" "$R" --profile tiger --dry-run start 2>&1)"
 expect_has "Profil-Automatik: --profile hat Vorrang" "$C" "Tiger (PowerPC)"
 rm -f "$AH/vms/leopard/qemu.pid"
 
+echo "== macOS-Pfad mit nachgebautem hdiutil (hängt eigene Endung an)"
+FB="$WORK/fakebin"; mkdir -p "$FB"
+cat > "$FB/hdiutil" <<'EOF2'
+#!/bin/sh
+# Attrappe: wie das echte hdiutil makehybrid, hängt aber ".cdr" an den Namen
+[ "$1" = makehybrid ] || exit 1
+shift; out=""; vol=""; src=""
+while [ $# -gt 0 ]; do
+  case $1 in
+    -o) out="$2"; shift 2 ;;
+    -hfs-volume-name) vol="$2"; shift 2 ;;
+    -*) shift ;;
+    *) src="$1"; shift ;;
+  esac
+done
+genisoimage -quiet -hfs -r -V "$vol" -o "$out.cdr" "$src"
+EOF2
+chmod +x "$FB/hdiutil"
+MH="$WORK/machome"; mkdir -p "$MH/vms/leopard"; : > "$MH/vms/leopard/disk.qcow2"
+C="$(PATH="$FB:$PATH" ROSETO_HOST_OS=Darwin ROSETO_HOME="$MH" "$R" --dry-run run "$F/MSN Installer.dmg" 2>&1)"
+if ls "$MH"/vms/leopard/disc-*.iso >/dev/null 2>&1; then ok "hdiutil-Endung wird korrigiert"; else bad "hdiutil-Endung wird korrigiert" "$C"; fi
+if ls -d "$MH"/vms/leopard/*.d >/dev/null 2>&1; then bad "Hilfsordner aufgeräumt"; else ok "Hilfsordner aufgeräumt"; fi
+C="$(PATH="$FB:$PATH" ROSETO_HOST_OS=Darwin ROSETO_HOME="$MH" "$R" --dry-run tools 2>&1)"
+expect_has "tools mit hdiutil" "$C" "Roseto Tools"
+
 echo "== Integration (echtes QEMU)"
 if ! command -v qemu-system-ppc >/dev/null 2>&1 || ! command -v qemu-img >/dev/null 2>&1; then
   echo "  (übersprungen: qemu-system-ppc nicht installiert)"

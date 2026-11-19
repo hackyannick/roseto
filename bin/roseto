@@ -50,7 +50,7 @@ resolve_root() {
 ROSETO_ROOT="$(resolve_root)"
 GUEST_SRC="$ROSETO_ROOT/guest"
 ROSETO_HOME="${ROSETO_HOME:-$HOME/.roseto}"
-HOST_OS="$(uname -s)"
+HOST_OS="${ROSETO_HOST_OS:-$(uname -s)}"   # ROSETO_HOST_OS nur für Tests
 
 # Konfiguration laden: ~/.roseto/config enthält Zeilen der Form ROSETO_X=wert.
 # Bereits gesetzte Umgebungsvariablen haben Vorrang.
@@ -403,8 +403,23 @@ make_disc() { # quellordner volumename ziel.iso
   local src="$1" vol="$2" out="$3"
   rm -f "$out"
   if [ "$HOST_OS" = Darwin ] && have hdiutil; then
-    hdiutil makehybrid -quiet -hfs -hfs-volume-name "$vol" -o "$out" "$src" >/dev/null ||
-      die "hdiutil konnte das Disk-Image nicht erstellen."
+    # hdiutil hängt je nach Version eine eigene Endung an (.iso, .cdr, .dmg).
+    # Deshalb in einen leeren Ordner erzeugen und die entstandene Datei
+    # anschließend unter dem gewünschten Namen ablegen.
+    local tmpd="$out.d" msg made
+    rm -rf "$tmpd"; mkdir -p "$tmpd"
+    if ! msg="$(hdiutil makehybrid -hfs -hfs-volume-name "$vol" -o "$tmpd/disc" "$src" 2>&1)"; then
+      rm -rf "$tmpd"
+      die "hdiutil konnte das Disk-Image nicht erstellen: $msg"
+    fi
+    made=""
+    for made in "$tmpd"/disc*; do [ -f "$made" ] && break; done
+    if [ -z "$made" ] || [ ! -f "$made" ]; then
+      rm -rf "$tmpd"
+      die "hdiutil hat keine Datei erzeugt. Ausgabe: $msg"
+    fi
+    mv "$made" "$out"
+    rm -rf "$tmpd"
   elif have genisoimage; then
     genisoimage -quiet -hfs -r -J -V "$vol" -o "$out" "$src" || die "genisoimage fehlgeschlagen."
   elif have mkisofs; then
