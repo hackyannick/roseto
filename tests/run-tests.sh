@@ -140,6 +140,17 @@ expect_has "PowerPC-App -> VM mit Disk" "$C" "disc-"
 mkdir -p "$WORK/k,omma"; cp -R "$B" "$WORK/k,omma/"
 C="$(ROSETO_HOME="$WORK/k,omma/home" "$R" --dry-run setup "$F/text.txt" 2>&1)"
 expect_has "Kommas in Pfaden escaped" "$C" "k,,omma"
+# Profil-Automatik: nur leopard eingerichtet -> wird ohne --profile benutzt
+AH="$WORK/auto"; mkdir -p "$AH/vms/leopard"; : > "$AH/vms/leopard/disk.qcow2"
+C="$(ROSETO_HOME="$AH" "$R" --dry-run start 2>&1)"
+expect_has "Profil-Automatik: einziges eingerichtetes" "$C" "Leopard (PowerPC)"
+# tiger UND leopard eingerichtet, leopard läuft -> leopard
+mkdir -p "$AH/vms/tiger"; : > "$AH/vms/tiger/disk.qcow2"; echo $$ > "$AH/vms/leopard/qemu.pid"
+C="$(ROSETO_HOME="$AH" "$R" --dry-run start 2>&1)"
+expect_has "Profil-Automatik: laufendes Profil" "$C" "verwende das laufende Profil 'leopard'"
+C="$(ROSETO_HOME="$AH" "$R" --profile tiger --dry-run start 2>&1)"
+expect_has "Profil-Automatik: --profile hat Vorrang" "$C" "Tiger (PowerPC)"
+rm -f "$AH/vms/leopard/qemu.pid"
 
 echo "== Integration (echtes QEMU)"
 if ! command -v qemu-system-ppc >/dev/null 2>&1 || ! command -v qemu-img >/dev/null 2>&1; then

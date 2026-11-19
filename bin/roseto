@@ -865,6 +865,28 @@ cmd_doctor() {
 # Argumente
 # --------------------------------------------------------------------------
 
+# Ohne --profile: Läuft das Standard-Profil nicht bzw. ist es nicht
+# eingerichtet, aber genau ein anderes Profil läuft bzw. ist eingerichtet,
+# wird automatisch dieses verwendet.
+auto_profile() {
+  local def="$PROFILE" p running="" n_running=0 ready="" n_ready=0
+  vm_running && return 0
+  for p in $PROFILES; do
+    use_profile "$p"
+    if vm_running; then running="$p"; n_running=$((n_running + 1)); fi
+    if [ -f "$DISK" ]; then ready="$p"; n_ready=$((n_ready + 1)); fi
+  done
+  use_profile "$def"
+  if [ "$n_running" -eq 1 ]; then
+    use_profile "$running"
+    info "verwende das laufende Profil '$running' (Standard ist '$def')"
+  elif [ "$n_running" -eq 0 ] && [ ! -f "$DISK" ] && [ "$n_ready" -eq 1 ]; then
+    use_profile "$ready"
+    info "verwende Profil '$ready' – das Standard-Profil '$def' ist nicht eingerichtet"
+  fi
+  return 0
+}
+
 main() {
   local args=() profile="$ROSETO_PROFILE" cmd
   while [ $# -gt 0 ]; do
@@ -880,6 +902,10 @@ main() {
   set -- ${args[@]+"${args[@]}"}
   cmd="${1:-help}"
   [ $# -gt 0 ] && shift
+  case $cmd in
+    setup|install|status|doctor|info|hosts|version|--version|-v|help|--help|-h) ;;
+    *) [ -z "$PROFILE_EXPLICIT" ] && auto_profile ;;
+  esac
   case $cmd in
     run)            cmd_run "$@" ;;
     info)           cmd_info "$@" ;;
