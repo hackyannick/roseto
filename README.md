@@ -153,6 +153,8 @@ Programme, die nur für Classic gebaut sind (z. B. eine OS-9-Version von MSN Exp
 ROSETO_PROFILE=tiger            # Standard-Profil
 ROSETO_RAM=1024                 # RAM in MB (mac99: max. 2048)
 ROSETO_RESOLUTION=1280x1024x32  # Bildschirmauflösung des PowerPC-Macs
+ROSETO_FULLSCREEN=1             # PowerPC-Mac direkt im Vollbild starten
+ROSETO_ZOOM=0                   # Bild beim Vergrößern des Fensters NICHT mitskalieren
 ROSETO_TABLET=1                 # USB-Tablet statt Maus (Mauszeiger ohne "Einfangen")
 ROSETO_VERBOSE_BOOT=1           # Mac OS X im ausführlichen Modus starten
 ROSETO_QEMU_EXTRA="-smp 1"      # zusätzliche QEMU-Optionen
@@ -164,6 +166,7 @@ Die Daten liegen in `~/.roseto/`: `vms/<profil>/disk.qcow2` ist die Festplatte, 
 
 - **Nichts startet automatisch:** Sind die Gast-Werkzeuge installiert (`roseto tools`)? Das Protokoll im PowerPC-Mac steht unter `~/Library/Application Support/Roseto/agent.log`.
 - **QEMU startet nicht:** `roseto log` und `roseto doctor`.
+- **Fenster zu klein:** Fenster einfach größer ziehen oder mit dem grünen Knopf auf Vollbild schalten, das Bild skaliert mit. Bei einem PowerPC-Mac, der mit einer älteren Roseto-Version gestartet wurde: im QEMU-Menü **View → Zoom To Fit** einschalten. Für mehr Arbeitsfläche statt größerer Schrift `ROSETO_RESOLUTION` erhöhen. Mac OS X kann die Auflösung im Gast nicht selbst ändern, sie gilt ab dem nächsten Start.
 - **Mauszeiger hängt/springt:** In der QEMU-Fensterleiste die Maus freigeben (Ctrl+Alt+G) oder `ROSETO_TABLET=1` ausprobieren.
 - **Server nicht erreichbar:** Im PowerPC-Mac im Terminal `ping 10.0.2.2` bzw. `cat /etc/hosts` prüfen. Ping kann in QEMUs Benutzer-Netzwerk ausfallen, obwohl TCP funktioniert; besser mit `curl http://10.0.2.2:PORT/` testen.
 

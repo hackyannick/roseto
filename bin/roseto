@@ -284,6 +284,30 @@ qemu_escape() { # Kommas in Pfaden für QEMU-Optionen verdoppeln
   printf '%s' "${1//,/,,}"
 }
 
+qemu_major() { # Hauptversion von QEMU (leer, falls unbekannt)
+  "$ROSETO_QEMU" --version 2>/dev/null | head -n 1 |
+    sed -n 's/.*version \([0-9][0-9]*\)\..*/\1/p'
+}
+
+display_opt() {
+  # Das macOS-Fenster (cocoa) skaliert das Bild des PowerPC-Macs mit, wenn
+  # das Fenster vergrößert oder auf Vollbild geschaltet wird (zoom-to-fit,
+  # ab QEMU 7.1). Ab QEMU 9 wird dabei zusätzlich weich interpoliert.
+  # Abschalten mit ROSETO_ZOOM=0.
+  local d="$ROSETO_DISPLAY" major
+  case $d in
+    cocoa)
+      if [ "${ROSETO_ZOOM:-1}" != 0 ]; then
+        d="cocoa,zoom-to-fit=on"
+        major="$(qemu_major)"
+        if [ -n "$major" ] && [ "$major" -ge 9 ]; then
+          d="$d,zoom-interpolation=on"
+        fi
+      fi ;;
+  esac
+  printf '%s' "$d"
+}
+
 build_qemu_cmd() { # boot-laufwerk(c|d) [cd-image]
   local boot="$1" cd="${2:-}" cdopt
   cdopt="if=ide,index=2,media=cdrom"
@@ -307,7 +331,8 @@ build_qemu_cmd() { # boot-laufwerk(c|d) [cd-image]
   fi
   [ -n "${ROSETO_VERBOSE_BOOT:-}" ] && QEMU_CMD+=(-prom-env "boot-args=-v")
   [ -n "${ROSETO_TABLET:-}" ] && QEMU_CMD+=(-device usb-tablet)
-  [ -n "${ROSETO_DISPLAY:-}" ] && QEMU_CMD+=(-display "$ROSETO_DISPLAY")
+  [ -n "${ROSETO_DISPLAY:-}" ] && QEMU_CMD+=(-display "$(display_opt)")
+  [ -n "${ROSETO_FULLSCREEN:-}" ] && QEMU_CMD+=(-full-screen)
   if [ -n "${ROSETO_QEMU_EXTRA:-}" ]; then
     # bewusst ungequotet: zusätzliche Optionen werden an Leerzeichen getrennt
     # shellcheck disable=SC2206
